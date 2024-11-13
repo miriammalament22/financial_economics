@@ -1,0 +1,577 @@
+---
+title: "Asignación Especial 1"
+author: "Miriam Malament y Victoria Sanchez Hernandorena"
+date: "29-09-2022"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning=FALSE, include=FALSE}
+#Importo librerías
+library(quantmod)   
+library(xts)       
+library(rvest)     
+library(tidyverse) 
+library(stringr)   
+library(forcats)    # working with factors
+library(lubridate)  # working with dates in tibbles / data frames
+library(plotly)     # Interactive plots
+library(corrplot)   # Visuazlize correlation plots
+library(data.table)
+library(tidyquant)
+library(pacman)
+library(fPortfolio)
+library(dplyr)
+library(PortfolioAnalytics)
+library(ROI)
+library(foreach)
+library(DEoptim)
+library(iterators)
+library(fGarch)
+library(Rglpk)
+library(quadprog)
+library(ROI)
+library(ROI.plugin.glpk)
+library(ROI.plugin.quadprog)
+library(ROI.plugin.symphony)
+library(pso)
+library(GenSA)
+library(corpcor)
+library(testthat)
+library(nloptr)
+library(MASS)
+library(robustbase)
+setwd("~/TAF")
+```
+
+
+#### a) Obtener todos los componentes pertenecientes al índice S&P 500, en cada momento del tiempo, desde el 2010 hasta el primer trimestre del 2022.
+
+
+Para obtener todos los activos pertenecientes al índice S&P 500, en cada momento del tiempo, debemos hacer un *web scraping*. Tomaremos como referencia la [página de Wikipedia](https://en.wikipedia.org/wiki/List_of_S%26P_500_companies).
+
+```{r}
+library(rvest)
+# Web-scrape SP500 stock list
+sp_500 <- read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies") %>%
+  html_node("table.wikitable") %>%
+  html_table() 
+# Format names
+names(sp_500) <- sp_500 %>% 
+  names() %>% 
+  str_to_lower() %>% 
+  make.names()
+# Show results
+sp_500 
+```
+
+A los efectos del trabajo, nos interesa conocer los *cambios* que hubo en el índice. Para ello, generaremos un código que nos permita conocer qué cambios hubo en los componentes pertencientes al índice. Nos dirá qué activos fueron reemplazados por qué otros y en qué momento. 
+```{r}
+wikispx <- read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
+currentconstituents <- wikispx %>%
+  html_node('#constituents') %>%
+  html_table(header = TRUE)
+currentconstituents
+
+currentconstituents$Date <- currentconstituents$`Date first added`
+
+spxchanges <- wikispx %>%
+  html_node('#changes') %>%
+  html_table(header = FALSE, fill = TRUE) %>%
+  dplyr::filter(row_number() > 2) %>% # First two rows are headers
+  `colnames<-`(c('Date','AddTicker','AddName','RemovedTicker','RemovedName','Reason')) %>%
+  mutate(Date = as.Date(Date, format = '%B %d, %Y'),
+         year = year(Date),
+         month = month(Date))
+spxchanges
+```
+
+
+#### b) Conformar un portafolio de 20 acciones, donde haya por lo menos 1 acción de cada sector (según la definición de la clasificación GICS). Dichas acciones podrán volver a elegirse al final de cada trimestre (si es que quieren cambiar el set de activos a considerar). Como punto de partida las acciones elegidas deberían ser parte del S&P 500 al momento de la elección.
+
+Antes de conformar el portafolio, es interesante deternos a analizar los distinos sectores y la frecuencia con la que aparecen: 
+```{r}
+sp_500 %>%
+  # Summarise data by frequency
+  group_by(gics.sector) %>%
+  summarise(count = n()) %>%
+  # Visualize 
+  ggplot(aes(x = gics.sector %>% fct_reorder(count),
+             y = count
+  )) + 
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = count), size = 3, nudge_y = 4, nudge_x = .1) + 
+  scale_y_continuous(limits = c(0,100)) +
+  ggtitle(label = "Sector Frequency Among SP500 Stocks") +
+  xlab(label = "GICS Sector") +
+  theme(plot.title = element_text(size = 16)) + 
+  coord_flip() 
+```
+
+Ahora, una vez que entendimos que hay once senctores, debemos pasar a elegir los activos con los que trabajaremos en el resto del ejercicio. Para ello, haremos una selección aleatoria en dos partes: por un lado, tomaremos una acción de cada sector (cumpliendo el requerimiento) y, las nueve acciones restantes serán elegidas de manera aleatoria. Desde ya, tendremos que asegurarnos que ninguna acción se repita. 
+```{r}
+#Selecciono a partir del sector
+sample_part_1 <- sp_500 %>%
+  group_by(gics.sector)%>%
+  slice_sample(n=1) 
+#Selección aleatoria
+sample_part_2 <- sample(sp_500$symbol, 9)
+#Selección completa
+full_sample <- data.table(symbol= c(sample_part_1$symbol, sample_part_2))
+
+#Chequeo que no se repitan
+if(length(unique(full_sample$symbol)) == 20){
+  "TRUE"
+}
+```
+
+Una vez realizada la selección de las acciones del portafolio, almacenaremos los nombres de los símbolos en 'full_sample.' 
+```{r}
+#
+full_sample <- data.table(symbols= c('GOOGL', 'NKE', 'CAG', 'COP', 'SPGI', 'TMO',  'CMI', 
+                                     'GLW', 'HWM', 'ESS', 'NRG',  'NDSN',  'MNST', 'VICI', 
+                                     'ADP', 'KIM', 'ADBE',  'LIN',  'FITB', 'HPE'))
+```
+
+#### c) Obtener los precios de dichas acciones (extendiéndose hasta finales del segundo trimestre de 2022 -1Q22- para dichas series de precios).
+
+Con la función tq_get obtendremos los precios de las acciones desde 2010 hasta junio 2022. 
+```{r, warning= FALSE}
+prices_sp_500 <- full_sample$symbol %>%
+  tq_get(get  = "stock.prices",
+         from = "2010-01-01",
+         to   = "2022-06-30") %>%
+  group_by(symbol) 
+```
+
+#### d) Obtener los precios de por lo menos 3 fondos de renta variable (ETFs/Mutual Funds de manejo pasivo o activo) que tengan como benchmark al S&P 500.
+
+De la misma manera que con el ítem anterior, obtendremos los precios de los ETF con la función tq_get. 
+
+Pero antes, ¿qué son las ETF?
+
+
+La sigla ETF corresponde a **Exchange-Traded Fund**. Los mismos consisten en vehículos para invertir y están compuestos por canastas de activos. Se caracterizan y se diferencian de los fondos comunes de inversión, debido a que se pueden comprar y vender rápidamente en plazas bursátiles. 
+
+
+Es posible dividir los ETFs en dos tipos según su administración: activa o pasiva
+
+
+Los ETF de gestión pasiva la cartera se compone de manera que pueda replicar los movimientos de un determinado índice ya existente. 
+
+Por otra parte, con aquellos que son de gestión activa la cartera se arma en base a criterios propios si replicar los movimientos de un índice determinado. 
+
+Los ETFs en los que nos enfocamos para realizar este trabajo son: 
+
+
+  - **XLK**: Esta ETF ofrece exposición física y sigue un índice S&P technology select sector total return index. Por lo tanto, el rendimiento de sus acciones va a ser equivalente al rendimiento de las acciones que componen el índice de referencia. 
+  
+  - **IVV**: Esta ETF sigue un índice S&P 500 Daily Total Return Index. Se caracteriza porque ofrece exposición física y el rendimiento de sus acciones es equivalente al rendimiento de las acciones que componen el índice de referencia.
+
+  - **VOO**: Al igual que la IVV, esta ETF sigue un índice S&P 500 Daily Total Return Index. Por lo tanto, el rendimiento de sus acciones será equivalente al rendimiento de las acciones que componen el índice de referencia.
+
+
+```{r, warning=FALSE}
+prices_etf <- c("XLK", "IVV", "VOO")  %>%
+  tq_get(get  = "stock.prices",
+         from = "2010-01-01",
+         to   = "2022-03-31") %>%
+  group_by(symbol) 
+```
+
+#### e y f) Realizar una optimización de portafolios, para cada uno de los trimestres -en base a datos históricos-, encontrando los siguientes:
+- Portafolio de Mínima Varianza Global.
+- Portafolio de Máximo Ratio de Sharpe.
+
+Para poder realizar la optimización del portafolio, primero debemos obtener los **retornos** de las acciones. 
+
+```{r, warning=FALSE, message=FALSE}
+# Creamos un vector con los símbolos
+symbols <- full_sample$symbol
+# Cargamos la data de los precios de 2010 hasta junio 2022
+prices <- quantmod::getSymbols(
+  Symbols = symbols,
+  src = "yahoo",
+  from = "2010-1-1",
+  to = "2022-6-30",
+  auto.assign = TRUE,
+  warnings = FALSE
+) %>%
+  purrr::map(.f = ~ quantmod::Ad(get(x = .x))) %>%
+  purrr::reduce(.f = merge) %>%
+  `colnames<-`(value = symbols)
+```
+
+Luego, obtenemos los retornos **mensuales**:
+```{r, warning=FALSE, message=FALSE}
+asset_returns_xts <- xts::to.daily(
+  x = prices,
+  drop.time = TRUE,
+  indexAt = "lastof",
+  OHLC = FALSE
+) %>%
+  PerformanceAnalytics::Return.calculate(method = "discrete") %>%
+  stats::na.omit()
+```
+
+```{r, warning=FALSE, message=FALSE, include=FALSE}
+library(readxl)
+asset_returns_xts_2 <- read_excel("~/Downloads/returns_trim.xlsx")
+
+asset_returns_xts_2$Date_2 <- asset_returns_xts_2$...1
+asset_returns_xts_2$...1 <- NULL
+
+asset_returns_xts_3 <- asset_returns_xts_2 %>% 
+  mutate(Date = as.Date(Date_2, format = "%Y/%m/%d"))
+
+asset_returns_xts_3$Date_2 <- NULL
+
+asset_returns_xts_3 <- asset_returns_xts_3 %>% 
+  mutate_if(is.numeric, round, digits = 3)
+```
+
+Lo mostramos en la siguiente tabla: 
+```{r, warning=FALSE, message=FALSE,  out.width="50%", include=TRUE}
+asset_returns_xts_3[,1:10]%>%DT::datatable(extensions = 'Buttons', 
+                       options = list(dom = 'Blfrtip', 
+                                      buttons = c('copy', 'csv', 'excel', 'pdf', 'print'), 
+                                      columnDefs = list(list(className = 'dt-center', targets = 5)),
+                                      pageLength = 5, autoWidth = TRUE ))
+
+asset_returns_xts_3[,11:20]%>%DT::datatable(extensions = 'Buttons', 
+                       options = list(dom = 'Blfrtip', 
+                                      buttons = c('copy', 'csv', 'excel', 'pdf', 'print'), 
+                                      columnDefs = list(list(className = 'dt-center', targets = 5)),
+                                      pageLength = 5, autoWidth = TRUE ))
+```
+Adicionalmente, podemos armar un gráfico con los retornos de, por ejemplo, diez de nuestras acciones del portafolio: 
+```{r, warning=FALSE, message=FALSE, echo=FALSE, fig.align='center'}
+library(highcharter)
+highchart(type = "stock") %>%
+  # Add chart main title
+  hc_title(text = "Monthly Log Returns for GOOGL, NKE, CAG, COP, SPGI") %>%
+  # Add returns series to highchart objects
+  # We use "symbols" to reference series since we may need to add/remove ETF's in the future
+  # Use matrix sub-setting and character indexing to select returns by column
+  hc_add_series(
+    data = asset_returns_xts[, symbols[[1]]],
+    name = symbols[[1]]
+  ) %>%
+  hc_add_series(
+    data = asset_returns_xts[, symbols[[2]]],
+    name = symbols[[2]]
+  ) %>%
+  hc_add_series(
+    data = asset_returns_xts[, symbols[[3]]],
+    name = symbols[[3]]
+  ) %>%
+  hc_add_series(
+    data = asset_returns_xts[, symbols[[4]]],
+    name = symbols[[4]]
+  ) %>%
+  hc_add_series(
+    data = asset_returns_xts[, symbols[[5]]],
+    name = symbols[[5]]
+  )  %>%
+  # Add theme to highchart object
+  # More themes to be found in the vignette
+  hc_add_theme(hc_thm = hc_theme_flat()) %>%
+  # Navigator
+  hc_navigator(enabled = TRUE) %>%
+  # Scrollbar
+  hc_scrollbar(enabled = TRUE) %>%
+  # Exporting
+  hc_exporting(enabled = TRUE) %>%
+  # Add legend
+  hc_legend(enabled = TRUE)
+
+```
+
+Ahora, definimos los trimestres a analizar.
+```{r, warning=FALSE, message=FALSE}
+trimesters <- seq(as.Date("2010-01-01"), as.Date("2022-06-30"), by=90)
+trimesters
+```
+
+El portafolio de **mínima varianza global**
+```{r, warning=FALSE, message=FALSE}
+data_p2 = asset_returns_xts
+# create specification
+port = portfolio.spec(assets = c(colnames(data_p2)))
+# add long only constraint
+port = add.constraint(portfolio = port, type = "long_only")
+
+port_msd = add.objective(portfolio = port, type = "risk", name = "StdDev")
+minvar1 = optimize.portfolio(R = data_p2, portfolio = port_msd, optimize_method = "ROI")
+minvar1
+```
+
+El portafolio de **máximo ratio de Sharpe**
+```{r, warning=FALSE, message=FALSE}
+# Create Portfolio object
+max_exp_return_portfolio <- PortfolioAnalytics::portfolio.spec(assets = symbols)
+# Add the full investment constraint that specifies the weights must sum to 1
+max_exp_return_portfolio <- PortfolioAnalytics::add.constraint(
+  portfolio = max_exp_return_portfolio,
+  type = "full_investment"
+)
+# Add the box constraint that ensure the weights are between 0.1 and 0.6
+max_exp_return_portfolio <- PortfolioAnalytics::add.constraint(
+  portfolio = max_exp_return_portfolio,
+  type = "box", min = 0.05, max = 0.6
+)
+maxSR<- optimize.portfolio(R=asset_returns_xts, portfolio=max_exp_return_portfolio, 
+                                   optimize_method="ROI", 
+                                   maxSR=TRUE, trace=TRUE)
+
+maxSR
+```
+
+Graficamos:
+```{r, warning=FALSE, message=FALSE, echo=FALSE, include=FALSE}
+library(fPortfolio)
+data_p2 = as.timeSeries(data_p2)
+pspec = portfolioSpec()  #initial specification
+
+setNFrontierPoints(pspec) = 500  #random portfolios for the efficient frontier
+
+eff_front2 = portfolioFrontier(data_p2)  #strategy
+eff_front2
+```
+
+```{r, warning=FALSE, message=FALSE}
+tailoredFrontierPlot(eff_front2, sharpeRatio = FALSE, risk = "Sigma")
+```
+
+Ahora, haremos las optimizaciones buscando las ponderaciones de las acciones para cada trimestre. Para ello, comenzaremos el loop por separar la data diaria por trimestre. 
+
+```{r, warning=FALSE, message=FALSE, include=FALSE}
+library(readxl)
+df1 <- read_excel("~/Desktop/2 SEM 2022/Tópicos Avanzados en Finanzas/df1.xlsx", 
+    col_types = c("date", "numeric", "numeric", 
+        "numeric", "numeric", "numeric", 
+        "numeric", "numeric", "numeric", 
+        "numeric", "numeric", "numeric", 
+        "numeric", "numeric", "numeric", 
+        "numeric", "numeric", "numeric", 
+        "numeric", "numeric", "numeric"))
+```
+
+```{r, warning=FALSE, message=FALSE, include=FALSE}
+# data_tmp <- data.frame()
+# data <- list()
+# for(i in 1:(length(trimesters)-1) ){
+#  data_tmp <- df1  %>% filter(Date > trimesters[i] & Date < trimesters[i+1] )
+#  rownames(data_tmp) <- data_tmp$Date
+#  data_tmp$Date <- NULL
+#  data[[i]] <- data_tmp
+#  port[[i]] <- portfolio.spec(assets = c(colnames(data[[i]])))
+#  port[[i]] <- add.constraint(portfolio = port[[i]], type = "full_investment")
+#  port_msd[[i]] <- add.objective(portfolio = port[[i]], type = "risk", name = "StdDev")
+#}
+#  minvar1[[i]] <- optimize.portfolio(R = data_p2[[i]], portfolio = port_msd[[i]], optimize_method = "ROI") NOS DA LA MISMA PONDERACIÓN PARA TODO
+```
+
+#### g y h) Realizar una optimización de portafolios, para cada uno de los trimestres -en base a modelos factoriales y datos históricos-, encontrando los siguientes:
+
+
+ - Portafolio de Mínima Varianza Global.
+ - Portafolio de Máximo Ratio de Sharpe.
+ 
+ 
+En este apartado realizaremos la optimización de portafolios, pero en base a modelos factoriales además de datos históricos.
+```{r, warning=FALSE, message=FALSE}
+#Para Asset returns
+Ra <- full_sample$symbol %>%
+  tq_get(get  = "stock.prices",
+         from = "2010-01-01",
+         to   = "2022-03-31") %>%
+  group_by(symbol) %>%
+  tq_transmute(select     = adjusted, 
+               mutate_fun = periodReturn, 
+               period     = "monthly", 
+               col_rename = "Ra")
+Ra
+
+#Para Baseline return
+Rb <- c('SPY', 'IVV', 'VOO')  %>%
+  tq_get(get  = "stock.prices",
+         from = "2010-01-01",
+         to   = "2022-03-31") %>%
+  tq_transmute(select     = adjusted, 
+               mutate_fun = periodReturn, 
+               period     = "monthly", 
+               col_rename = "Rb")
+Rb
+
+#Junto
+RaRb <- left_join(Ra, Rb, by = c("date" = "date"))
+RaRb
+```
+
+En este gráfico está representada en azul la recta que se ajusta a un modelo lineal de la relación entre los retornos del mercado y los retornos del portafolio. La pendiente de esta recta está dada por el beta del CAPM que calculamos. Por lo tanto, podemos ver que el gráfico de dispersión se condice con esta relación lineal.  
+```{r, warning=FALSE, message=FALSE}
+#Gráfico
+RaRb %>%
+  ggplot(aes(x = Rb,
+             y = Ra)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = 'lm',
+              se = FALSE) +
+  theme_classic() +
+  labs(x = 'Benchmark Returns',
+       y = "Portfolio Returns",
+       title = "Portfolio returns vs Benchmark returns") +
+  scale_x_continuous(breaks = seq(-0.1,0.1,0.01),
+                     labels = scales::percent) +
+  scale_y_continuous(breaks = seq(-0.1,0.1,0.01),
+                     labels = scales::percent)
+```
+
+```{r, warning=FALSE, message=FALSE}
+#Modelo CAPM
+RaRb_capm <- RaRb %>%
+  tq_performance(Ra = Ra, 
+                 Rb = Rb, 
+                 performance_fun = table.CAPM)
+RaRb_capm
+
+#Ahora los precios
+stock_prices <- full_sample$symbol %>%
+    tq_get(get  = "stock.prices",
+           from = "2010-01-01",
+           to   = "2022-03-31")
+stock_prices
+
+#Plot
+stock_prices %>%
+  group_by(symbol) %>%
+  mutate(close = close / close[1]) %>%
+  ungroup() %>%
+  ggplot(aes(x = date, y = close, col = symbol)) +
+  geom_line()
+```
+
+```{r, warning=FALSE, message=FALSE}
+wts <- c(0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05,
+         0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05)
+
+RaRb %>%
+  tq_performance(Ra = Ra, Rb = Rb, performance_fun = table.CAPM)
+```
+
+#### i) Realizar la comparación histórica de la performance entre los portafolios obtenidos
+y los fondos de renta variable (su “competencia”).
+
+
+Ahora, queremos ver cómo rindió nuestro portafolio con respecto a los ETF. Primero, analizaremos el crecimiento del portafolio: 
+
+```{r, warning=FALSE, message=FALSE}
+portfolio_growth_monthly <- Ra %>%
+  tq_portfolio(assets_col   = symbol, 
+               returns_col  = Ra, 
+               weights      = wts, 
+               col_rename   = "investment.growth",
+               wealth.index = TRUE) %>%
+  mutate(investment.growth = investment.growth * 10000)
+
+portfolio_growth_monthly %>%
+  ggplot(aes(x = date, y = investment.growth)) +
+  geom_line(size = 2, color = palette_light()[[1]]) +
+  labs(title = "Portfolio Growth",
+       x = "", y = "Portfolio Value") +
+  geom_smooth(method = "loess") +
+  theme_tq() +
+  scale_color_tq() +
+  scale_y_continuous(labels = scales::dollar)
+```
+
+
+El gráfico muestra el crecimiento del dinero invertido en el portafolio con una inversión inicial de $10.000 
+
+Eso quiere decir que el portafolio: 
+```{r, warning=FALSE, message=FALSE, echo = FALSE}
+ knitr::include_graphics(here::here("Plot Portfolio performance.png"))
+```
+
+Para los ETF: 
+
+```{r, warning=FALSE, message=FALSE, echo = FALSE}
+knitr::include_graphics(here::here("ETF Performance.png"))
+```
+
+Ahora, solo queda compararlos: 
+
+```{r, warning=FALSE, message=FALSE, echo = FALSE}
+knitr::include_graphics(here::here("ETF vs Port.png"))
+```
+
+
+### ANEXO 
+
+Acciones utilizadas: 
+
+  - **GOOGL**: Corresponde a la empresa Alphabet Inc. Pertenece al sector de servicios de comunicación y a la sub-industria de medios interactivos y servicios 
+
+
+  - **NKE**:  Corresponde a la empresa Nike, inc. Pertenece al sector de consumo discrecional y a la sub-industria de vestimenta, accesorios y bienes de lujo
+
+
+  - **CAG**: Corresponde a la empresa Conagra Brands. Pertenece al sector de productos básicos de consumo y a la sub-industria de alimentos y carnes empaquetados
+
+
+  - **COP**: Corresponde a la empresa ConocoPhillips. Pertenece al sector de energía y a la sub-industria de exploración y producción de petróleo y gas
+
+
+  - **SPGI**: Corresponde a la empresa S&P Global. Pertenece al sector financiero y a la sub-industria de intercambios financieros y datos 
+
+
+  - **TMO**: Corresponde a la empresa Thermo Fisher Scientific. Pertenece al sector de salud y a la sub-industria de herramientas y servicios de ciencias de la vida.
+
+
+  - **CMI**: Corresponde a la empresa Cummins. Pertenece al sector industrial y a la sub-industria de maquinaria industrial.
+
+
+  - **GLW**: Corresponde  a la empresa Corning Inc. Pertenece al sector de tecnologías de la información y a la sub-industria de componentes electrónicos 
+
+
+  - **HWM**: Corresponde a la empresa Howmet Aerospace. Pertenece al sector industrial y a la sub-industria aeroespacial y de defensa.
+
+
+  - **ESS**: Corresponde a la empresa Essex Property Trust. Pertenece al sector inmobiliario y a la sub-industria de fondos de inversión inmobiliarios residenciales.
+
+
+  - **NRG**: Corrsponde a la empresa NRG. Pertenece al sector de utilidades y a la sub-industria  de productores de energía independientes y comerciantes de energía
+
+
+  - **NDSN**: Corresponde a la empresa Nordson Corporation. Pertenece al sector industrial y a la sub-industria de maquinaria industrial.
+
+
+  - **MNST**: Corresponde a la empresa Monster Beverage. Pertenece productos básicos de consumo y a la sub-industria de bebidas blandas.
+
+
+  - **VICI**: Corresponde a la empresa Vici Properties. Pertenece al sector inmobiliario y a la sub-industria de hotelería
+
+
+  - **ADP**: Corresponde a la empresa ADP. Pertenece al sector de tecnología e la información y a la sub-industria de procesamiento de datos y servicios externalizados  
+
+
+  - **KIM**: Corresponde a la empresa Kimco Realty. Pertenece al sector inmobiliario y a la sub-industria de venta minorista de fondos de inversión inmobiliarios.
+
+
+  - **ADBE**: Corresponde a la empresa Adobe Inc. Pertenece al sector de tecnología de la información y la sub-industria de software de aplicación.
+
+
+  - **LIN**: Corresponde a la empresa Linde plc. Pertenece al sector de materiales y a la sub-industria de gases industriales.
+
+
+  - **FITB**: Corresponde a la empresa Fifth Third Bank. Pertenece al sector financiero y a la sub-indsutria de bancos regionales.
+
+  - **HPE**: Corresponde a la empresa Hewlett Packard Enterprise. Pertenece al sector de tecnología de la información y a la sub-industria de hardware de tecnología, almacenamiento y periféricos. 
+
+
